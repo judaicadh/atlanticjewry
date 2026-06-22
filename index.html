@@ -218,11 +218,22 @@
   .item {
     border: 1px solid var(--line); border-radius: 3px; padding: 6px 8px; margin-bottom: 4px;
     background: #fafaf5; font-size: 12px;
+    display: flex; gap: 8px; align-items: flex-start;
   }
+  .item .item-thumb {
+    flex: 0 0 auto; width: 48px; height: 48px; border-radius: 2px; overflow: hidden;
+    background: #ece9df; border: 1px solid var(--line); display: block;
+  }
+  .item .item-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .item .item-thumb.placeholder {
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 16px;
+  }
+  .item .item-main { flex: 1 1 auto; min-width: 0; }
   .item .item-title { font-weight: 600; color: var(--ink); }
   .item .item-url {
-    word-break: break-all; font-size: 11px; color: var(--fam); text-decoration: none;
-    display: block; margin-top: 2px;
+    font-size: 11px; color: var(--fam); text-decoration: none;
+    display: inline-block; margin-top: 2px;
   }
   .item .item-url:hover { text-decoration: underline; }
   .item .item-actions { display: flex; gap: 6px; margin-top: 4px; font-size: 11px; }
@@ -479,6 +490,91 @@ const DATA = {"individuals":{"@83665456@":{"id":"@83665456@","name":"Emma Mordec
     store.setAll(ITEMS_KEY, all);
   }
   const countItems = pid => getItems(pid).length;
+
+  // Fallback rules mapping a manifest URL -> its human-facing item page. Used only when the
+  // manifest declares no homepage/related link of its own. Add a rule to support a new repo;
+  // the first matching rule wins, so list specific patterns before the generic one.
+  const ITEM_URL_RULES = [
+    // Colenda (Penn): /items/ark:/81431/p3r49gz4w/manifest -> /catalog/81431-p3r49gz4w
+    { re: /^(https?:\/\/[^/]+)\/items\/ark:\/(\d+)\/([^/]+)\/manifest\b/i,
+      to: m => `${m[1]}/catalog/${m[2]}-${m[3]}` },
+    // Generic IIIF: drop a trailing /manifest or /manifest.json
+    { re: /^(https?:\/\/.+?)\/manifest(?:\.json)?\/?$/i, to: m => m[1] },
+  ];
+  function deriveItemUrl(url) {
+    for (const rule of ITEM_URL_RULES) {
+      const m = (url || '').match(rule.re);
+      if (m) { const out = rule.to(m); if (out && out !== url) return out; }
+    }
+    return null;
+  }
+  // Best public link for an item: the manifest's own homepage (authoritative, set once
+  // fetched), else a link derived from the manifest URL, else the raw URL.
+  function itemLink(it) {
+    return it.itemUrl || deriveItemUrl(it.url) || it.url;
+  }
+  // Build a small thumbnail request from a IIIF Image API service base.
+  const iiifThumb = (base, size = 96) => `${base.replace(/\/$/, '')}/full/!${size},${size}/0/default.jpg`;
+
+  function pickId(v) {
+    if (!v) return null;
+    if (Array.isArray(v)) return pickId(v[0]);
+    if (typeof v === 'object') return v.id || v['@id'] || null;
+    return v; // string
+  }
+  // Pick a human-facing link from a IIIF homepage (v3) / related (v2) value,
+  // preferring an entry whose format is HTML when several are offered.
+  function pickHomepage(v) {
+    const arr = Array.isArray(v) ? v : (v == null ? [] : [v]);
+    const html = arr.find(x => x && typeof x === 'object' && /html/i.test(x.format || ''));
+    return pickId(html || arr[0]);
+  }
+
+  // Fetch a manifest (IIIF Presentation v2 or v3) and extract { itemUrl, thumb }.
+  // Best-effort: returns whatever it can, derives the item link even if the fetch fails.
+  async function fetchManifestMeta(url) {
+    const out = {};
+    try {
+      const res = await fetch(url, { headers: { Accept: 'application/json' } });
+      if (res.ok) {
+        const m = await res.json();
+        // Authoritative: the manifest's own link to its item page (v3 homepage / v2 related).
+        out.itemUrl = pickHomepage(m.homepage) || pickHomepage(m.related) || undefined;
+        // Thumbnail: prefer the declared thumbnail's image service, else its direct id.
+        const th = Array.isArray(m.thumbnail) ? m.thumbnail[0] : m.thumbnail;
+        const svc = pickId(th && th.service);
+        if (svc) out.thumb = iiifThumb(svc);
+        else if (th) out.thumb = pickId(th) || undefined;
+        // Fallback: first canvas image (v2 sequences / v3 items).
+        if (!out.thumb) {
+          const canvas = (m.sequences && m.sequences[0] && m.sequences[0].canvases && m.sequences[0].canvases[0])
+            || (m.items && m.items[0]);
+          const resource = canvas && (
+            (canvas.images && canvas.images[0] && canvas.images[0].resource)
+            || (canvas.items && canvas.items[0] && canvas.items[0].items && canvas.items[0].items[0] && canvas.items[0].items[0].body)
+          );
+          const csvc = pickId(resource && resource.service);
+          if (csvc) out.thumb = iiifThumb(csvc);
+          else if (resource) out.thumb = pickId(resource) || undefined;
+        }
+      }
+    } catch (e) { /* offline or CORS — fall back to URL-pattern derivation below */ }
+    // No declared homepage (or fetch failed): derive the item page from the manifest URL.
+    if (!out.itemUrl) out.itemUrl = deriveItemUrl(url) || undefined;
+    return out;
+  }
+
+  // Merge fetched metadata into a stored item and persist.
+  function updateItemMeta(pid, url, meta) {
+    const all = store.getAll(ITEMS_KEY);
+    const list = all[pid]; if (!list) return false;
+    const it = list.find(x => normUrl(x.url) === normUrl(url));
+    if (!it) return false;
+    it.metaTried = true;
+    Object.assign(it, meta);
+    store.setAll(ITEMS_KEY, all);
+    return true;
+  }
 
   document.getElementById('btn-export').onclick = () => {
     const blob = new Blob([JSON.stringify({
@@ -1351,14 +1447,23 @@ const DATA = {"individuals":{"@83665456@":{"id":"@83665456@","name":"Emma Mordec
       : `<a class="fs-link" href="https://www.familysearch.org/search/record/results?q.givenName=${encodeURIComponent(p.given || '')}&q.surname=${encodeURIComponent(p.surname || '')}${p.birthYear ? `&q.birthLikeDate.from=${p.birthYear-2}&q.birthLikeDate.to=${p.birthYear+2}` : ''}" target="_blank" rel="noopener">Search FamilySearch</a>`;
 
     const items = getItems(p.id);
-    const itemsHtml = items.length ? items.map(it => `
+    const itemsHtml = items.length ? items.map(it => {
+      const link = itemLink(it);
+      const thumb = it.thumb
+        ? `<a class="item-thumb" href="${escapeHtml(link)}" target="_blank" rel="noopener"><img src="${escapeHtml(it.thumb)}" alt="" loading="lazy"></a>`
+        : `<a class="item-thumb placeholder" href="${escapeHtml(link)}" target="_blank" rel="noopener">📄</a>`;
+      return `
       <div class="item" data-url="${escapeHtml(it.url)}">
-        <div class="item-title">${escapeHtml(it.title || hostnameOf(it.url))}</div>
-        <a class="item-url" href="${escapeHtml(it.url)}" target="_blank" rel="noopener">${escapeHtml(it.url)}</a>
-        <div class="item-actions">
-          <button data-action="remove">remove</button>
+        ${thumb}
+        <div class="item-main">
+          <div class="item-title">${escapeHtml(it.title || hostnameOf(link))}</div>
+          <a class="item-url" href="${escapeHtml(link)}" target="_blank" rel="noopener">View item ↗</a>
+          <div class="item-actions">
+            <button data-action="remove">remove</button>
+          </div>
         </div>
-      </div>`).join('') : '<div class="hint" style="margin-top:4px;">No items linked yet.</div>';
+      </div>`;
+    }).join('') : '<div class="hint" style="margin-top:4px;">No items linked yet.</div>';
 
     const ann = getAnnot(p.id);
     const swatch = ann.color ? `<span class="swatch" style="background:${escapeHtml(ann.color)}"></span>` : '';
@@ -1451,9 +1556,14 @@ const DATA = {"individuals":{"@83665456@":{"id":"@83665456@","name":"Emma Mordec
       } else if (!res.ok) {
         showFeedback('error', escapeHtml(res.msg || 'Could not add.'));
       } else {
+        const addedUrl = urlEl.value.trim();
         urlEl.value = ''; titleEl.value = '';
         showFeedback('ok', 'Added.');
         renderDetail(p); renderList(currentList);
+        // Fetch the manifest to derive the item link + thumbnail, then refresh.
+        fetchManifestMeta(addedUrl).then(meta => {
+          if (updateItemMeta(p.id, addedUrl, meta) && selectedId === p.id) renderDetail(p);
+        });
       }
     });
     detailBody.querySelectorAll('.item [data-action="remove"]').forEach(btn => {
@@ -1462,6 +1572,14 @@ const DATA = {"individuals":{"@83665456@":{"id":"@83665456@","name":"Emma Mordec
         if (confirm('Remove this item from ' + p.name + '?')) {
           removeItem(p.id, url); renderDetail(p); renderList(currentList);
         }
+      });
+    });
+
+    // Backfill item links + thumbnails for items added before this metadata existed.
+    items.forEach(it => {
+      if (it.thumb || it.metaTried) return;
+      fetchManifestMeta(it.url).then(meta => {
+        if (updateItemMeta(p.id, it.url, meta) && selectedId === p.id) renderDetail(p);
       });
     });
   }
